@@ -1,0 +1,1 @@
+aws ec2 describe-instances --output table --region "ap-northeast-1"  --query 'Reservations[*].Instances[*].[InstanceId,SecurityGroups[].GroupName | join(`, `, @),Placement.AvailabilityZone,BlockDeviceMappings[].DeviceName | join(`, `, @), BlockDeviceMappings[].Ebs.DeleteOnTermination | join(`, `, to_array(to_string(@)))]'

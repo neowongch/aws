@@ -1,0 +1,1024 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  DevOps Agent - Full Deployment: Agent Space + Alarm Auto-Trigger Investigation + Zoom Notification
+  
+  This template provisions:
+  1. DevOps Agent Space with IAM roles and operator app
+  2. AWS Account Association (monitor account)
+  3. Event Channel registration + webhook generation (fully automated)
+  4. Lambda function that calls DevOps Agent Webhook on alarm
+  5. EventBridge rule to capture CloudWatch Alarm state changes
+  6. Secrets Manager secret auto-populated with webhook URL and HMAC secret
+  7. (Optional) Lambda + EventBridge rule to send investigation summary to Zoom
+  
+  FULLY AUTOMATED - no manual steps required after deployment.
+  For Zoom notifications: provide ZoomWebhookUrl, ZoomVerificationToken, and requests layer S3 location.
+
+Parameters:
+  AgentSpaceName:
+    Type: String
+    Default: DevOpsAgentSpace
+    Description: Name for the DevOps Agent Space
+  AgentSpaceDescription:
+    Type: String
+    Default: Auto-provisioned DevOps Agent Space for alarm-triggered investigations
+    Description: Description for the Agent Space
+  ZoomWebhookUrl:
+    Type: String
+    Default: ''
+    Description: (Optional) Zoom Incoming Webhook endpoint URL. Leave empty to disable Zoom notifications.
+  ZoomVerificationToken:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: (Optional) Zoom Incoming Webhook verification token. Required if ZoomWebhookUrl is provided.
+
+Conditions:
+  EnableZoomNotification: !Not [!Equals [!Ref ZoomWebhookUrl, '']]
+
+Resources:
+  ###############################################
+  # PART 0: IDC Instance Auto-Discovery
+  ###############################################
+
+  # IAM role for IDC discovery Lambda
+  IdcDiscoveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'devops-idc-discovery-role-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: IdcDiscoveryAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sso:ListInstances
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # Lambda that discovers the IAM Identity Center instance ARN
+  IdcDiscoveryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'devops-idc-discovery-${AWS::StackName}'
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt IdcDiscoveryRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib3
+          import traceback
+
+          http = urllib3.PoolManager()
+
+          def handler(event, context):
+              print(json.dumps(event))
+              try:
+                  if event['RequestType'] in ('Create', 'Update'):
+                      result = on_create(event)
+                  else:
+                      result = {'IdcInstanceArn': 'deleted'}
+                  send_response(event, context, 'SUCCESS', result)
+              except Exception as e:
+                  print(f"Error: {e}")
+                  traceback.print_exc()
+                  send_response(event, context, 'FAILED', {'Error': str(e)})
+
+          def on_create(event):
+              sso = boto3.client('sso-admin')
+              response = sso.list_instances()
+              instances = response.get('Instances', [])
+
+              if not instances:
+                  raise Exception("No IAM Identity Center instance found in this account/organization.")
+
+              # Use the first active instance
+              instance = instances[0]
+              idc_instance_arn = instance['InstanceArn']
+              print(f"Discovered IDC Instance ARN: {idc_instance_arn}")
+
+              return {'IdcInstanceArn': idc_instance_arn}
+
+          def send_response(event, context, status, data):
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': f"See logs: {context.log_stream_name}"[:200],
+                  'PhysicalResourceId': 'idc-discovery',
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': data or {}
+              })
+              http.request('PUT', event['ResponseURL'],
+                           body=body.encode('utf-8'),
+                           headers={'Content-Type': 'application/json'})
+
+  # Custom Resource — discovers IDC instance ARN
+  IdcDiscovery:
+    Type: Custom::IdcDiscovery
+    Properties:
+      ServiceToken: !GetAtt IdcDiscoveryFunction.Arn
+
+  ###############################################
+  # PART 1: DevOps Agent Space Provisioning
+  ###############################################
+
+  # IAM role assumed by DevOps Agent service to monitor the account
+  DevOpsAgentSpaceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'DevOpsAgentRole-AgentSpace-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: aidevops.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:aidevops:${AWS::Region}:${AWS::AccountId}:agentspace/*'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AIDevOpsAgentAccessPolicy
+      Policies:
+        - PolicyName: AllowCreateServiceLinkedRoles
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowCreateServiceLinkedRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateServiceLinkedRole
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/resource-explorer-2.amazonaws.com/AWSServiceRoleForResourceExplorer'
+
+  # IAM role for the operator app (DevOps Agent Web App with IDC)
+  DevOpsOperatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'DevOpsAgentRole-WebappAdmin-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: aidevops.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:aidevops:${AWS::Region}:${AWS::AccountId}:agentspace/*'
+          - Sid: TrustedIdentityPropagation
+            Effect: Allow
+            Principal:
+              Service: aidevops.amazonaws.com
+            Action: sts:SetContext
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              'Null':
+                sts:RequestContextProviders: 'false'
+              ForAllValues:ArnEquals:
+                sts:RequestContextProviders: 'arn:aws:iam::aws:contextProvider/IdentityCenter'
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:aidevops:${AWS::Region}:${AWS::AccountId}:agentspace/*'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AIDevOpsOperatorAppAccessPolicy
+      Policies:
+        - PolicyName: IDCOperatorActions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowDevOpsAgentIDCUserAccess
+                Effect: Allow
+                Action:
+                  - identitystore:DescribeUser
+                Resource:
+                  - !Sub 'arn:aws:identitystore::${AWS::AccountId}:identitystore/*'
+                  - 'arn:aws:identitystore:::user/*'
+
+  # The Agent Space resource (with both IAM + IDC for web app access)
+  AgentSpace:
+    Type: AWS::DevOpsAgent::AgentSpace
+    DependsOn:
+      - DevOpsAgentSpaceRole
+      - DevOpsOperatorRole
+      - IdcDiscovery
+    Properties:
+      Name: !Ref AgentSpaceName
+      Description: !Ref AgentSpaceDescription
+      OperatorApp:
+        Iam:
+          OperatorAppRoleArn: !GetAtt DevOpsOperatorRole.Arn
+        Idc:
+          IdcInstanceArn: !GetAtt IdcDiscovery.IdcInstanceArn
+          OperatorAppRoleArn: !GetAtt DevOpsOperatorRole.Arn
+
+  # Association linking this account to the Agent Space (monitor account)
+  MonitorAssociation:
+    Type: AWS::DevOpsAgent::Association
+    Properties:
+      AgentSpaceId: !GetAtt AgentSpace.AgentSpaceId
+      ServiceId: aws
+      Configuration:
+        Aws:
+          AssumableRoleArn: !GetAtt DevOpsAgentSpaceRole.Arn
+          AccountId: !Ref AWS::AccountId
+          AccountType: monitor
+
+  ###############################################
+  # PART 2: Webhook Setup (Custom Resource)
+  ###############################################
+
+  # Secrets Manager — auto-populated with webhook credentials
+  DevOpsWebhookSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub 'devopsagent/webhook-${AWS::StackName}'
+      Description: DevOps Agent Webhook URL and HMAC secret (auto-populated during deployment)
+      SecretString: '{"webhookUrl":"pending","webhookSecret":"pending"}'
+
+  # IAM role for the webhook setup Custom Resource Lambda
+  WebhookSetupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'devops-webhook-setup-role-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DevOpsAgentAndSecretsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DevOpsAgentAccess
+                Effect: Allow
+                Action:
+                  - aidevops:RegisterService
+                  - aidevops:DeregisterService
+                  - aidevops:AssociateService
+                  - aidevops:DisassociateService
+                  - aidevops:ListAssociations
+                  - aidevops:ListWebhooks
+                  - aidevops:ListServices
+                Resource: '*'
+              - Sid: SecretsManagerAccess
+                Effect: Allow
+                Action:
+                  - secretsmanager:PutSecretValue
+                Resource: !Ref DevOpsWebhookSecret
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # Custom Resource Lambda — registers EventChannel, associates it, captures webhook secret
+  WebhookSetupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'devops-webhook-setup-${AWS::StackName}'
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt WebhookSetupRole.Arn
+      Timeout: 120
+      MemorySize: 128
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref DevOpsWebhookSecret
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib3
+          import traceback
+
+          http = urllib3.PoolManager()
+
+          def handler(event, context):
+              print(json.dumps(event))
+              try:
+                  if event['RequestType'] in ('Create', 'Update'):
+                      result = on_create(event)
+                  elif event['RequestType'] == 'Delete':
+                      result = on_delete(event)
+                  else:
+                      result = {}
+                  send_response(event, context, 'SUCCESS', result)
+              except Exception as e:
+                  print(f"Error: {e}")
+                  traceback.print_exc()
+                  send_response(event, context, 'FAILED', {'Error': str(e)})
+
+          def on_create(event):
+              props = event['ResourceProperties']
+              agent_space_id = props['AgentSpaceId']
+              secret_arn = props['SecretArn']
+
+              devops = boto3.client('devops-agent')
+              secrets = boto3.client('secretsmanager')
+
+              # Step 1: Register EventChannel service (account-level, idempotent)
+              print("Step 1: Registering EventChannel service...")
+              service_id = None
+              try:
+                  reg_response = devops.register_service(
+                      service='eventChannel',
+                      serviceDetails={'eventChannel': {'type': 'webhook'}}
+                  )
+                  service_id = reg_response['serviceId']
+                  print(f"Registered new service ID: {service_id}")
+              except devops.exceptions.ValidationException as e:
+                  if 'already registered' in str(e):
+                      print("EventChannel already registered. Finding existing service ID...")
+                      services = devops.list_services()
+                      for svc in services.get('services', []):
+                          if svc.get('serviceType') == 'eventChannel':
+                              service_id = svc['serviceId']
+                              print(f"Found existing service ID: {service_id}")
+                              break
+                      if not service_id:
+                          raise Exception("EventChannel registered but could not find serviceId")
+                  else:
+                      raise
+
+              # Step 2: Associate service with Agent Space (creates webhook, returns secret)
+              print("Step 2: Associating EventChannel with Agent Space...")
+              assoc_response = devops.associate_service(
+                  agentSpaceId=agent_space_id,
+                  serviceId=service_id,
+                  configuration={'eventChannel': {}}
+              )
+
+              # Extract webhook credentials from response
+              webhook_data = assoc_response.get('webhook', {})
+              webhook_url = webhook_data.get('webhookUrl', '')
+              webhook_secret = webhook_data.get('webhookSecret', '')
+              webhook_id = webhook_data.get('webhookId', '')
+              webhook_type = webhook_data.get('webhookType', 'hmac')
+
+              association_id = assoc_response.get('association', {}).get('associationId', '')
+
+              print(f"Webhook URL: {webhook_url}")
+              print(f"Webhook ID: {webhook_id}")
+              print(f"Webhook Type: {webhook_type}")
+              print(f"Association ID: {association_id}")
+              # Note: webhookSecret is intentionally NOT logged
+
+              if not webhook_url or not webhook_secret:
+                  raise Exception(
+                      f"Webhook credentials not returned. Response keys: {list(assoc_response.keys())}. "
+                      f"Webhook data keys: {list(webhook_data.keys())}"
+                  )
+
+              # Step 3: Store credentials in Secrets Manager
+              print("Step 3: Storing webhook credentials in Secrets Manager...")
+              secrets.put_secret_value(
+                  SecretId=secret_arn,
+                  SecretString=json.dumps({
+                      'webhookUrl': webhook_url,
+                      'webhookSecret': webhook_secret,
+                      'webhookId': webhook_id,
+                      'webhookType': webhook_type,
+                      'serviceId': service_id,
+                      'associationId': association_id
+                  })
+              )
+              print("Webhook credentials stored successfully!")
+
+              # Return only non-sensitive data (CFN response has 4096 byte limit)
+              return {
+                  'ServiceId': service_id,
+                  'AssociationId': association_id,
+                  'WebhookId': webhook_id
+              }
+
+          def on_delete(event):
+              props = event['ResourceProperties']
+              agent_space_id = props['AgentSpaceId']
+
+              devops = boto3.client('devops-agent')
+
+              # Best-effort cleanup
+              try:
+                  associations = devops.list_associations(agentSpaceId=agent_space_id)
+                  for assoc in associations.get('associations', []):
+                      config = assoc.get('configuration', {})
+                      if 'eventChannel' in config:
+                          service_id = assoc['serviceId']
+                          print(f"Removing eventChannel service {service_id}...")
+                          try:
+                              devops.disassociate_service(
+                                  agentSpaceId=agent_space_id,
+                                  serviceId=service_id
+                              )
+                          except Exception as e:
+                              print(f"Disassociate warning: {e}")
+                          try:
+                              devops.deregister_service(serviceId=service_id)
+                          except Exception as e:
+                              print(f"Deregister warning: {e}")
+              except Exception as e:
+                  print(f"Cleanup warning (non-fatal): {e}")
+              return {}
+
+          def send_response(event, context, status, data):
+              # Keep response minimal to stay under 4096 byte CFN limit
+              response_data = {}
+              for k, v in (data or {}).items():
+                  if k != 'Error':
+                      response_data[k] = str(v)[:200]
+                  else:
+                      response_data[k] = str(v)[:500]
+
+              physical_id = data.get('ServiceId', 'webhook-setup')
+
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': f"See logs: {context.log_stream_name}"[:200],
+                  'PhysicalResourceId': physical_id,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': response_data
+              })
+              http.request('PUT', event['ResponseURL'],
+                           body=body.encode('utf-8'),
+                           headers={'Content-Type': 'application/json'})
+
+  # Custom Resource — triggers webhook registration and captures credentials
+  WebhookSetup:
+    Type: Custom::DevOpsWebhookSetup
+    DependsOn:
+      - MonitorAssociation
+    Properties:
+      ServiceToken: !GetAtt WebhookSetupFunction.Arn
+      AgentSpaceId: !GetAtt AgentSpace.AgentSpaceId
+      SecretArn: !Ref DevOpsWebhookSecret
+
+  ###############################################
+  # PART 3: Alarm Auto-Trigger Investigation
+  ###############################################
+
+  # IAM Role — Lambda Execution Role for webhook executor
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'devops-webhook-executor-role-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSSecretsManagerClientReadOnlyAccess
+      Policies:
+        - PolicyName: LambdaBasicExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: logs:CreateLogGroup
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/devops-webhook-executor-${AWS::StackName}:*'
+
+  # Lambda Function — Webhook Executor (triggered by EventBridge on alarm or health event)
+  DevOpsWebhookExecutorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - WebhookSetup
+    Properties:
+      FunctionName: !Sub 'devops-webhook-executor-${AWS::StackName}'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Architectures:
+        - x86_64
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref DevOpsWebhookSecret
+      Code:
+        ZipFile: |
+          // DevOps Agent WebHook Executor
+          // Triggered by EventBridge for: CloudWatch Alarms, AWS Health Events
+          // Sends HMAC-SHA256 signed POST to DevOps Agent Webhook to start investigation
+          const crypto = require('crypto');
+          const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
+
+          exports.handler = async (event) => {
+            console.log("WebHook Executor invoked");
+            console.log("Event:", JSON.stringify(event, null, 2));
+
+            const secretArn = process.env.SECRET_ARN;
+            if (!secretArn) throw new Error("SECRET_ARN environment variable is not set");
+
+            // Retrieve webhook credentials from Secrets Manager
+            const secretsClient = new SecretsManagerClient();
+            const secretResponse = await secretsClient.send(new GetSecretValueCommand({ SecretId: secretArn }));
+            const { webhookUrl, webhookSecret } = JSON.parse(secretResponse.SecretString);
+
+            if (!webhookUrl || !webhookSecret || webhookUrl === 'pending') {
+              throw new Error("Webhook credentials not yet configured in Secrets Manager.");
+            }
+
+            // Detect event type and build payload accordingly
+            const source = event.source || '';
+            const detailType = event['detail-type'] || '';
+            let payload;
+
+            if (source === 'aws.cloudwatch' && detailType === 'CloudWatch Alarm State Change') {
+              payload = buildAlarmPayload(event);
+            } else if (source === 'aws.health' && detailType === 'AWS Health Event') {
+              payload = buildHealthEventPayload(event);
+            } else if (source === 'aws.ec2' && detailType === 'EC2 Instance State-change Notification') {
+              payload = buildEc2StateChangePayload(event);
+            } else {
+              payload = buildGenericPayload(event);
+            }
+
+            const payloadJson = JSON.stringify(payload);
+            const timestamp = new Date().toISOString();
+
+            // Generate HMAC-SHA256 signature: timestamp:payload
+            const hmac = crypto.createHmac('sha256', webhookSecret);
+            hmac.update(`${timestamp}:${payloadJson}`, 'utf8');
+            const signature = hmac.digest('base64');
+
+            console.log('Sending webhook:', { url: webhookUrl, payloadSize: payloadJson.length, source, detailType });
+
+            const response = await fetch(webhookUrl, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'x-amzn-event-signature': signature,
+                'x-amzn-event-timestamp': timestamp
+              },
+              body: payloadJson
+            });
+
+            const responseBody = await response.text();
+            console.log('Response:', { status: response.status, body: responseBody });
+
+            if (!response.ok) {
+              throw new Error(`Webhook failed with status ${response.status}: ${responseBody}`);
+            }
+
+            return { statusCode: 200, body: 'Investigation triggered successfully' };
+          };
+
+          // Build payload for CloudWatch Alarm events
+          function buildAlarmPayload(event) {
+            const detail = event.detail || {};
+            const alarmName = detail.alarmName || 'Unknown';
+            const state = detail.state?.value || 'ALARM';
+            const reason = detail.state?.reason || 'No reason provided';
+            const region = event.region || 'us-east-1';
+            const alarmArn = event.resources?.[0] || 'Unknown';
+
+            let namespace = 'AWS';
+            const metrics = detail.configuration?.metrics;
+            if (metrics && metrics.length > 0) {
+              namespace = metrics[0].metricStat?.metric?.namespace || 'AWS';
+            }
+
+            return {
+              eventType: 'incident',
+              incidentId: `alarm-${alarmName}-${Math.floor(Date.now() / 1000)}`,
+              action: 'created',
+              priority: 'HIGH',
+              title: `CloudWatch Alarm: ${alarmName}`,
+              description: `CloudWatch Alarm "${alarmName}" entered ${state} state.\n\nReason: ${reason}\nAlarm ARN: ${alarmArn}\nRegion: ${region}`,
+              service: namespace,
+              timestamp: new Date().toISOString(),
+              data: {
+                metadata: {
+                  event_source: 'cloudwatch_alarm',
+                  alarm_name: alarmName,
+                  alarm_arn: alarmArn,
+                  region: region,
+                  state: state,
+                  reason: reason
+                }
+              }
+            };
+          }
+
+          // Build payload for AWS Health events
+          function buildHealthEventPayload(event) {
+            const detail = event.detail || {};
+            const service = detail.service || 'AWS';
+            const eventTypeCode = detail.eventTypeCode || 'Unknown';
+            const category = detail.eventTypeCategory || 'issue';
+            const region = event.region || 'us-east-1';
+
+            const descriptions = detail.eventDescription || [];
+            const description = descriptions.length > 0
+              ? descriptions[0].latestDescription || 'No description available'
+              : 'No description available';
+
+            const entities = detail.affectedEntities || [];
+            const affectedResources = entities.map(e => e.entityValue).join(', ') || 'Unknown';
+
+            const priority = category === 'issue' ? 'HIGH' : 'MEDIUM';
+            const title = category === 'issue'
+              ? `Health Issue: ${service} - ${eventTypeCode}`
+              : `Scheduled Maintenance: ${service} - ${eventTypeCode}`;
+
+            return {
+              eventType: 'incident',
+              incidentId: `health-${eventTypeCode}-${Math.floor(Date.now() / 1000)}`,
+              action: 'created',
+              priority: priority,
+              title: title,
+              description: `${description}\n\nAffected Resources: ${affectedResources}\nService: ${service}\nCategory: ${category}\nRegion: ${region}`,
+              service: service,
+              timestamp: new Date().toISOString(),
+              data: {
+                metadata: {
+                  event_source: 'aws_health',
+                  service: service,
+                  event_type_code: eventTypeCode,
+                  event_type_category: category,
+                  affected_resources: affectedResources,
+                  region: region
+                }
+              }
+            };
+          }
+
+          // Build payload for EC2 Instance State-change events
+          function buildEc2StateChangePayload(event) {
+            const detail = event.detail || {};
+            const instanceId = detail['instance-id'] || 'Unknown';
+            const state = detail.state || 'unknown';
+            const region = event.region || 'us-east-1';
+            const account = event.account || 'Unknown';
+
+            const priority = state === 'terminated' ? 'HIGH' : 'MEDIUM';
+
+            return {
+              eventType: 'incident',
+              incidentId: `ec2-${state}-${instanceId}-${Math.floor(Date.now() / 1000)}`,
+              action: 'created',
+              priority: priority,
+              title: `EC2 Instance ${state}: ${instanceId}`,
+              description: `EC2 instance ${instanceId} has entered "${state}" state.\n\nInstance ID: ${instanceId}\nState: ${state}\nRegion: ${region}\nAccount: ${account}\n\nInvestigate whether this was expected (scaling, deployment) or unexpected (hardware failure, spot interruption).`,
+              service: 'EC2',
+              timestamp: new Date().toISOString(),
+              data: {
+                metadata: {
+                  event_source: 'ec2_state_change',
+                  instance_id: instanceId,
+                  state: state,
+                  region: region,
+                  account: account
+                }
+              }
+            };
+          }
+
+          // Generic fallback payload
+          function buildGenericPayload(event) {
+            const detailType = event['detail-type'] || 'Unknown Event';
+            const source = event.source || 'unknown';
+            const region = event.region || 'us-east-1';
+
+            return {
+              eventType: 'incident',
+              incidentId: `event-${source.replace('aws.','')}-${Math.floor(Date.now() / 1000)}`,
+              action: 'created',
+              priority: 'MEDIUM',
+              title: detailType,
+              description: `Event: ${detailType}\nSource: ${source}\nRegion: ${region}\n\n${JSON.stringify(event.detail || {}, null, 2).substring(0, 1000)}`,
+              service: source,
+              timestamp: new Date().toISOString(),
+              data: { metadata: { event_source: source, detail_type: detailType, region: region } }
+            };
+          }
+
+  # Lambda Permission — Allow EventBridge to invoke
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DevOpsWebhookExecutorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt InvestigationTriggerRule.Arn
+
+  # EventBridge Rule — Combined: CloudWatch Alarm + AWS Health Events + EC2 Termination (using $or)
+  InvestigationTriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'DevOpsAgent-InvestigationTrigger-${AWS::StackName}'
+      Description: Triggers DevOps Agent investigation on CloudWatch Alarms, EC2 Health Events, or EC2 unexpected termination
+      State: ENABLED
+      EventPattern:
+        $or:
+          - source:
+              - aws.health
+            detail-type:
+              - AWS Health Event
+            detail:
+              eventTypeCategory:
+                - issue
+                - scheduledChange
+          - source:
+              - aws.cloudwatch
+            detail-type:
+              - CloudWatch Alarm State Change
+            detail:
+              state:
+                value:
+                  - ALARM
+          - source:
+              - aws.ec2
+            detail-type:
+              - EC2 Instance State-change Notification
+            detail:
+              state:
+                - terminated
+                - stopped
+      Targets:
+        - Id: DevOpsWebhookExecutor
+          Arn: !GetAtt DevOpsWebhookExecutorFunction.Arn
+
+  ###############################################
+  # PART 4: Investigation Summary to Zoom
+  ###############################################
+
+  # IAM Role for the Zoom notification Lambda
+  ZoomNotificationRole:
+    Type: AWS::IAM::Role
+    Condition: EnableZoomNotification
+    Properties:
+      RoleName: !Sub 'devops-zoom-notify-role-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DevOpsAgentReadAndLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DevOpsAgentRead
+                Effect: Allow
+                Action:
+                  - aidevops:ListJournalRecords
+                  - aidevops:GetAgentSpace
+                Resource: !Sub 'arn:aws:aidevops:${AWS::Region}:${AWS::AccountId}:agentspace/*'
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # Lambda — Fetches investigation summary and sends to Zoom
+  ZoomNotificationFunction:
+    Type: AWS::Lambda::Function
+    Condition: EnableZoomNotification
+    Properties:
+      FunctionName: !Sub 'devops-zoom-notify-${AWS::StackName}'
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt ZoomNotificationRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Architectures:
+        - x86_64
+      Environment:
+        Variables:
+          ZOOM_WEBHOOK_URL: !Ref ZoomWebhookUrl
+          ZOOM_VERIFICATION_TOKEN: !Ref ZoomVerificationToken
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import re
+          import logging
+          import time
+          import urllib.request
+          import boto3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          ZOOM_WEBHOOK_URL = os.environ.get('ZOOM_WEBHOOK_URL', '')
+          ZOOM_VERIFICATION_TOKEN = os.environ.get('ZOOM_VERIFICATION_TOKEN', '')
+
+          devops_agent = boto3.client('devops-agent')
+
+          CONSOLE_URL_TPL = "https://{region}.console.aws.amazon.com/devops-agent/home?region={region}#/spaces"
+
+
+          def get_investigation_summary(agent_space_id, execution_id):
+              try:
+                  response = devops_agent.list_journal_records(
+                      agentSpaceId=agent_space_id,
+                      executionId=execution_id,
+                      recordType='investigation_summary_md',
+                      order='DESC',
+                      limit=1
+                  )
+                  records = response.get('records', [])
+                  if records:
+                      return records[0].get('content', '')
+                  return None
+              except Exception as e:
+                  logger.error(f"Failed to fetch journal records: {e}")
+                  return None
+
+
+          def md_to_plain(text):
+              text = re.sub(r'^#{1,3}\s+', '', text, flags=re.MULTILINE)
+              text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
+              text = re.sub(r'\*([^*]+)\*', r'\1', text)
+              text = re.sub(r'\n{3,}', '\n\n', text)
+              return text.strip()
+
+
+          def post_zoom(webhook_url, headers, payload):
+              data = json.dumps(payload).encode('utf-8')
+              req = urllib.request.Request(webhook_url, data=data, headers=headers, method='POST')
+              with urllib.request.urlopen(req) as resp:
+                  return resp.status
+
+
+          def send_zoom(title, summary_md, link):
+              if not ZOOM_WEBHOOK_URL or not ZOOM_VERIFICATION_TOKEN:
+                  logger.info("Zoom webhook not configured, skipping")
+                  return
+
+              plain_text = md_to_plain(summary_md)
+              full_text = f"{plain_text}\n\nFull details: {link}"
+
+              webhook_url = ZOOM_WEBHOOK_URL
+              if '?' not in webhook_url:
+                  webhook_url += '?format=full'
+              else:
+                  webhook_url += '&format=full'
+
+              headers = {
+                  "Content-Type": "application/json; charset=utf-8",
+                  "Authorization": ZOOM_VERIFICATION_TOKEN
+              }
+
+              max_len = 3900
+              if len(full_text) <= max_len:
+                  parts = [full_text]
+              else:
+                  parts = []
+                  remaining = full_text
+                  while len(remaining) > max_len:
+                      split_pos = remaining.rfind('\n\n', 0, max_len)
+                      if split_pos < max_len // 2:
+                          split_pos = remaining.rfind('\n', 0, max_len)
+                      if split_pos < max_len // 2:
+                          split_pos = max_len
+                      parts.append(remaining[:split_pos])
+                      remaining = remaining[split_pos:].lstrip('\n')
+                  if remaining:
+                      parts.append(remaining)
+
+              for i, part in enumerate(parts):
+                  head_text = f"{title} [{i+1}/{len(parts)}]" if len(parts) > 1 else title
+                  payload = {
+                      "head": {"text": head_text, "style": {"bold": True}},
+                      "body": [{"type": "message", "text": part}]
+                  }
+                  status = post_zoom(webhook_url, headers, payload)
+                  logger.info(f"Zoom [{i+1}/{len(parts)}]: {status}")
+                  if i < len(parts) - 1:
+                      time.sleep(0.5)
+
+
+          def lambda_handler(event, context):
+              logger.info(json.dumps(event))
+
+              detail_type = event.get('detail-type', '')
+              detail = event.get('detail', {})
+
+              if detail_type != 'Investigation Completed':
+                  return {'statusCode': 200, 'body': 'Ignored'}
+
+              metadata = detail.get('metadata', {})
+              agent_space_id = metadata.get('agent_space_id', '')
+              execution_id = metadata.get('execution_id', '')
+              data = detail.get('data', {})
+              priority = data.get('priority', 'UNKNOWN')
+              region = os.environ.get('AWS_REGION', 'us-east-1')
+
+              if not agent_space_id or not execution_id:
+                  return {'statusCode': 200, 'body': 'Missing IDs'}
+
+              summary_md = get_investigation_summary(agent_space_id, execution_id)
+              link = f"{CONSOLE_URL_TPL.format(region=region)}/{agent_space_id}/investigations/{execution_id}"
+              title = f"DevOps Agent Investigation Complete [{priority}]"
+
+              if not summary_md:
+                  summary_md = "Could not retrieve findings via API."
+
+              send_zoom(title, summary_md, link)
+              return {'statusCode': 200, 'body': 'Sent'}
+
+  # Lambda Permission — Allow EventBridge to invoke Zoom notification Lambda
+  ZoomNotificationInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: EnableZoomNotification
+    Properties:
+      FunctionName: !Ref ZoomNotificationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt InvestigationCompletedRule.Arn
+
+  # EventBridge Rule — Investigation Completed only (triggers Zoom notification)
+  InvestigationCompletedRule:
+    Type: AWS::Events::Rule
+    Condition: EnableZoomNotification
+    Properties:
+      Name: !Sub 'DevOpsAgent-InvestigationCompleted-${AWS::StackName}'
+      Description: Sends investigation summary to Zoom when DevOps Agent completes an investigation
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.aidevops
+        detail-type:
+          - Investigation Completed
+      Targets:
+        - Id: ZoomNotificationLambda
+          Arn: !GetAtt ZoomNotificationFunction.Arn
+
+Outputs:
+  AgentSpaceId:
+    Description: DevOps Agent Space ID
+    Value: !GetAtt AgentSpace.AgentSpaceId
+  AgentSpaceArn:
+    Description: DevOps Agent Space ARN
+    Value: !GetAtt AgentSpace.Arn
+  IdcInstanceArn:
+    Description: IAM Identity Center instance ARN (auto-discovered)
+    Value: !GetAtt IdcDiscovery.IdcInstanceArn
+  OperatorWebAppUrl:
+    Description: DevOps Agent Web App console URL
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/devopsagent/home?region=${AWS::Region}#/spaces/${AgentSpace.AgentSpaceId}'
+  WebhookId:
+    Description: Webhook ID (credentials stored in Secrets Manager)
+    Value: !GetAtt WebhookSetup.WebhookId
+  EventBridgeRuleArn:
+    Description: EventBridge rule ARN (CloudWatch Alarms + Health Events)
+    Value: !GetAtt InvestigationTriggerRule.Arn
+  LambdaFunctionArn:
+    Description: Webhook executor Lambda function ARN
+    Value: !GetAtt DevOpsWebhookExecutorFunction.Arn
+  SecretArn:
+    Description: Secrets Manager secret ARN (contains webhook URL + HMAC secret)
+    Value: !Ref DevOpsWebhookSecret
+  ZoomNotificationFunctionArn:
+    Condition: EnableZoomNotification
+    Description: Zoom notification Lambda function ARN
+    Value: !GetAtt ZoomNotificationFunction.Arn
+  InvestigationCompletedRuleArn:
+    Condition: EnableZoomNotification
+    Description: EventBridge rule ARN for Investigation Completed events
+    Value: !GetAtt InvestigationCompletedRule.Arn

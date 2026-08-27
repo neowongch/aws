@@ -488,6 +488,32 @@ Resources:
   # PART 3: Alarm Auto-Trigger Investigation
   ###############################################
 
+  # CloudWatch Alarm — EC2 Health (replicated from arn:aws:cloudwatch:us-east-1:015752183084:alarm:EC2Health)
+  # Actions intentionally left blank.
+  EC2HealthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: EC2Health
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 0
+      TreatMissingData: missing
+      ActionsEnabled: true
+      AlarmActions: []
+      OKActions: []
+      InsufficientDataActions: []
+      Metrics:
+        - Id: q1
+          Label: HealthyStatus
+          ReturnData: true
+          Period: 60
+          Expression: |-
+            SELECT MAX(StatusCheckFailed)
+            FROM SCHEMA("AWS/EC2", InstanceId)
+            GROUP BY InstanceId
+            ORDER BY MAX() DESC
+
   # IAM Role — Lambda Execution Role for webhook executor
   LambdaExecutionRole:
     Type: AWS::IAM::Role
@@ -757,12 +783,16 @@ Resources:
             detail:
               eventTypeCategory:
                 - issue
-                - scheduledChange
           - source:
               - aws.cloudwatch
             detail-type:
               - CloudWatch Alarm State Change
             detail:
+              alarmName:
+                - anything-but:
+                    wildcard:
+                      - "*IOPS*"
+                      - "*EngineCPUUtilization*"
               state:
                 value:
                   - ALARM

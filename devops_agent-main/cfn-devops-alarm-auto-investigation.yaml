@@ -793,6 +793,7 @@ Resources:
                     wildcard:
                       - "*IOPS*"
                       - "*EngineCPUUtilization*"
+                      - "*VolumeThroughputExceededCheck*"
               state:
                 value:
                   - ALARM

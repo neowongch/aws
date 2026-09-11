@@ -119,7 +119,7 @@ Skills 是模块化的指令集，用于为 Agent 提供针对您基础设施的
 
 ## 工作原理
 
-![架构图](ShengBig-DevOps%20Agent.drawio.png)
+![架构图](DevOps%20Agent.drawio.png)
 
 ```
 告警/Webhook/ServiceNow → DevOps Agent 调查 → 发现推送到 Slack

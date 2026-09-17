@@ -119,7 +119,7 @@ use the skills:
 
 ## How It Works
 
-![Architecture](ShengBig-DevOps%20Agent.drawio.png)
+![Architecture](DevOps%20Agent.drawio.png)
 
 ```
 Alarm/Webhook/ServiceNow → DevOps Agent investigates → Findings to Slack

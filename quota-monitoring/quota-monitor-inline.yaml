@@ -1,0 +1,174 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Cx quota-usage monitor (SELF-CONTAINED, inline code). Scheduled Lambda
+  that COUNTS resources (CloudFront distributions/functions/origin-request-policies,
+  Shield CF protections, Route 53 hosted zones + registered domains) and publishes a
+  CloudWatch ResourceCount metric per quota. Counts only — limit/utilization are
+  computed downstream. Deploy in us-east-1. No S3 packaging needed (code < 4096 chars).
+
+Parameters:
+  MetricNamespace:
+    Type: String
+    Default: Custom/QuotaMonitor
+  ScheduleExpression:
+    Type: String
+    Default: rate(1 day)
+  LambdaRuntime:
+    Type: String
+    Default: python3.13
+    AllowedValues: [python3.13, python3.12]
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+
+Resources:
+
+  QuotaMonitorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: quota-monitor-read-and-publish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadOnlyResourceCounts
+                Effect: Allow
+                Action:
+                  - cloudfront:ListDistributions
+                  - cloudfront:ListFunctions
+                  - cloudfront:ListOriginRequestPolicies
+                  - shield:ListProtections
+                  - route53:ListHostedZones
+                  - route53domains:ListDomains
+                  - sts:GetCallerIdentity
+                Resource: '*'
+              - Sid: PublishMetricsScopedToNamespace
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: !Ref MetricNamespace
+
+  QuotaMonitorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Counts quota-relevant resources and publishes ResourceCount metrics.
+      Runtime: !Ref LambdaRuntime
+      Handler: index.handler
+      Role: !GetAtt QuotaMonitorRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      Architectures: [arm64]
+      Environment:
+        Variables:
+          METRIC_NAMESPACE: !Ref MetricNamespace
+      Code:
+        ZipFile: |
+          import os,boto3
+          NS=os.environ.get("METRIC_NAMESPACE","Custom/QuotaMonitor")
+          R="us-east-1"
+          cw=boto3.client("cloudwatch",region_name=R)
+          cf=boto3.client("cloudfront",region_name=R)
+          sh=boto3.client("shield",region_name=R)
+          r53=boto3.client("route53")
+          rd=boto3.client("route53domains",region_name=R)
+          ACC=boto3.client("sts").get_caller_identity()["Account"]
+          def put(svc,q,n):
+              cw.put_metric_data(Namespace=NS,MetricData=[{"MetricName":"ResourceCount","Dimensions":[{"Name":"Service","Value":svc},{"Name":"QuotaName","Value":q},{"Name":"AccountId","Value":ACC}],"Value":float(n),"Unit":"Count"}])
+          def pages(fn,key,**kw):
+              m=None
+              while True:
+                  r=fn(**({**kw,"Marker":m} if m else kw))
+                  d=r.get(key) or {}
+                  for it in (d.get("Items") or []):yield it
+                  m=d.get("NextMarker")
+                  if not m:return
+          def handler(e,c):
+              tot=0;orp={};fnc={}
+              for p in cf.get_paginator("list_distributions").paginate():
+                  for d in ((p.get("DistributionList") or {}).get("Items") or []):
+                      tot+=1
+                      for cb in [d.get("DefaultCacheBehavior") or {}]+((d.get("CacheBehaviors") or {}).get("Items") or []):
+                          o=cb.get("OriginRequestPolicyId")
+                          if o:orp[o]=orp.get(o,0)+1
+                          for fa in ((cb.get("FunctionAssociations") or {}).get("Items") or []):
+                              a=fa.get("FunctionARN")
+                              if a:fnc[a]=fnc.get(a,0)+1
+              put("cloudfront","Distributions per AWS account",tot)
+              put("cloudfront","Max distributions per origin request policy",max(orp.values(),default=0))
+              put("cloudfront","Max distributions per function",max(fnc.values(),default=0))
+              put("cloudfront","CloudFront Functions per account",sum(1 for _ in pages(cf.list_functions,"FunctionList")))
+              put("cloudfront","Origin request policies per account",sum(1 for _ in pages(cf.list_origin_request_policies,"OriginRequestPolicyList",Type="custom")))
+              s=0
+              for p in sh.get_paginator("list_protections").paginate():
+                  for pr in (p.get("Protections") or []):
+                      if ":cloudfront:" in (pr.get("ResourceArn") or ""):s+=1
+              put("shield","CloudFront distribution protections",s)
+              hz=0
+              for p in r53.get_paginator("list_hosted_zones").paginate():hz+=len(p.get("HostedZones") or [])
+              put("route53","Hosted zones",hz)
+              dm=0
+              for p in rd.get_paginator("list_domains").paginate():dm+=len(p.get("Domains") or [])
+              put("route53domains","Registered domains",dm)
+              return {"ok":True,"distributions":tot}
+
+  QuotaMonitorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${QuotaMonitorFunction}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  SchedulerInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: invoke-quota-monitor
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt QuotaMonitorFunction.Arn
+
+  QuotaMonitorSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: quota-monitor-daily
+      Description: Triggers the quota-usage monitor on a fixed cadence.
+      ScheduleExpression: !Ref ScheduleExpression
+      FlexibleTimeWindow: { Mode: 'OFF' }
+      State: ENABLED
+      Target:
+        Arn: !GetAtt QuotaMonitorFunction.Arn
+        RoleArn: !GetAtt SchedulerInvokeRole.Arn
+        Input: '{}'
+        RetryPolicy:
+          MaximumRetryAttempts: 2
+
+Outputs:
+  FunctionName:
+    Value: !Ref QuotaMonitorFunction
+  FunctionArn:
+    Value: !GetAtt QuotaMonitorFunction.Arn
+  MetricNamespace:
+    Value: !Ref MetricNamespace
+  ScheduleName:
+    Value: !Ref QuotaMonitorSchedule
